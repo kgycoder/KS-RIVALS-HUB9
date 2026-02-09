@@ -93,15 +93,20 @@ local MIN_DISTANCE = 3
 local MAX_DISTANCE = 30
 local ZOOM_SPEED = 1.5
 
--- Full Auto 전용 변수 (수정됨)
+-- Full Auto 전용 변수 (전면 수정)
 local faTargetPlayer = nil
+local faCurrentFloor = nil
+local faLastValidFloor = nil
+local faMainConnection = nil
+local faAutoClickConnection = nil
 local faLoopActive = false
 local faLastAutoClickTime = 0
 local FA_CLICK_INTERVAL = 0.02
-local faAutoClickConnection = nil
-local faUpdateConnection = nil
-local faLastFloorPart = nil
-local faRotationAngle = 0
+local FA_FLOOR_DETECTION_RANGE = 100
+local FA_MIN_FLOOR_SIZE = 5
+local FA_HIDE_OFFSET = 0.3
+local faBodyVelocity = nil
+local faBodyGyro = nil
 
 -- No Cool Time 전용 변수
 local noCoolTimeConnection = nil
@@ -1349,136 +1354,280 @@ LocalPlayer.CharacterAdded:Connect(function(newChar)
 end)
 
 -- ============================================
--- FULL AUTO LOGIC (완전 재작성 - 바닥 오브젝트 기반)
+-- FULL AUTO LOGIC (완전 재설계)
 -- ============================================
 
-local function faFindClosestEnemy()
-    if not FULL_AUTO_ENABLED then return nil end
+-- 바닥 오브젝트인지 확인
+local function faIsValidFloor(part)
+    if not part or not part:IsA("BasePart") then
+        return false
+    end
+    
+    -- 최소 크기 확인
+    if part.Size.X < FA_MIN_FLOOR_SIZE or part.Size.Z < FA_MIN_FLOOR_SIZE then
+        return false
+    end
+    
+    -- 캐릭터 파트 제외
     local character = LocalPlayer.Character
-    if not character or not character:FindFirstChild("HumanoidRootPart") then return nil end
-    local myPos = character.HumanoidRootPart.Position
-    local closestPlayer = nil
-    local shortestDistance = math.huge
-    for _, player in pairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer and player.Character and isEnemy(player) then
-            local theirRoot = player.Character:FindFirstChild("HumanoidRootPart")
-            local theirHum = player.Character:FindFirstChild("Humanoid")
-            if theirRoot and theirHum and theirHum.Health > 0 then
-                local distance = (myPos - theirRoot.Position).Magnitude
-                if distance < shortestDistance then
-                    shortestDistance = distance
-                    closestPlayer = player
-                end
-            end
+    if character and part:IsDescendantOf(character) then
+        return false
+    end
+    
+    -- 다른 플레이어 캐릭터 제외
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.Character and part:IsDescendantOf(player.Character) then
+            return false
         end
     end
-    return closestPlayer
+    
+    return true
 end
 
-local function faFindNearestFloorPart(targetPosition)
-    local rayOrigin = targetPosition + Vector3.new(0, 5, 0)
-    local rayDirection = Vector3.new(0, -100, 0)
+-- 특정 위치 근처의 바닥 찾기
+local function faFindFloorNearPosition(position)
+    local rayOrigin = Vector3.new(position.X, position.Y + 10, position.Z)
+    local rayDirection = Vector3.new(0, -FA_FLOOR_DETECTION_RANGE, 0)
     
-    local rayParams = RaycastParams.new()
-    rayParams.FilterType = Enum.RaycastFilterType.Exclude
-    local filterList = {LocalPlayer.Character}
-    if faTargetPlayer and faTargetPlayer.Character then
-        table.insert(filterList, faTargetPlayer.Character)
-    end
-    rayParams.FilterDescendantsInstances = filterList
+    local raycastParams = RaycastParams.new()
+    raycastParams.FilterType = Enum.RaycastFilterType.Blacklist
     
-    local result = workspace:Raycast(rayOrigin, rayDirection, rayParams)
-    
-    if result and result.Instance then
-        local part = result.Instance
-        if part:IsA("BasePart") and part.CanCollide then
-            return part, result.Position
+    -- 필터에 모든 캐릭터 추가
+    local filterList = {}
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.Character then
+            table.insert(filterList, player.Character)
         end
+    end
+    raycastParams.FilterDescendantsInstances = filterList
+    raycastParams.IgnoreWater = true
+    
+    local raycastResult = workspace:Raycast(rayOrigin, rayDirection, raycastParams)
+    
+    if raycastResult and faIsValidFloor(raycastResult.Instance) then
+        return raycastResult.Instance, raycastResult.Position
     end
     
     return nil, nil
 end
 
-local function faPositionOnFloor(floorPart, floorPosition)
-    if not FULL_AUTO_ENABLED then return end
+-- 가장 가까운 적군 찾기
+local function faFindClosestEnemy()
+    if not FULL_AUTO_ENABLED then return nil end
+    
+    local character = LocalPlayer.Character
+    if not character or not character:FindFirstChild("HumanoidRootPart") then
+        return nil
+    end
+    
+    local myPos = character.HumanoidRootPart.Position
+    local closestEnemy = nil
+    local shortestDistance = math.huge
+    
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and isEnemy(player) and player.Character then
+            local enemyRoot = player.Character:FindFirstChild("HumanoidRootPart")
+            local enemyHum = player.Character:FindFirstChild("Humanoid")
+            
+            if enemyRoot and enemyHum and enemyHum.Health > 0 then
+                local distance = (myPos - enemyRoot.Position).Magnitude
+                
+                if distance < shortestDistance then
+                    shortestDistance = distance
+                    closestEnemy = player
+                end
+            end
+        end
+    end
+    
+    return closestEnemy
+end
+
+-- 물리 설정
+local function faSetupPhysics()
     local character = LocalPlayer.Character
     if not character then return end
     
-    local root = character:FindFirstChild("HumanoidRootPart")
+    local rootPart = character:FindFirstChild("HumanoidRootPart")
     local humanoid = character:FindFirstChild("Humanoid")
-    if not root or not humanoid then return end
     
-    local characterHeight = 2.5
-    local safeOffset = 0.1
-    local targetY = floorPosition.Y + characterHeight + safeOffset
+    if not rootPart or not humanoid then return end
     
-    local targetCFrame = CFrame.new(floorPosition.X, targetY, floorPosition.Z)
+    -- 충돌 비활성화
+    for _, part in pairs(character:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.CanCollide = false
+        end
+    end
     
-    faRotationAngle = (faRotationAngle + math.rad(45)) % (math.pi * 2)
-    targetCFrame = targetCFrame * CFrame.Angles(0, faRotationAngle, 0)
+    -- BodyVelocity로 중력 무효화
+    if not faBodyVelocity then
+        faBodyVelocity = Instance.new("BodyVelocity")
+        faBodyVelocity.MaxForce = Vector3.new(0, math.huge, 0)
+        faBodyVelocity.Velocity = Vector3.new(0, 0, 0)
+        faBodyVelocity.Parent = rootPart
+    end
     
-    root.CFrame = targetCFrame
-    root.Velocity = Vector3.new(0, 0, 0)
-    root.RotVelocity = Vector3.new(0, 0, 0)
-    humanoid.PlatformStand = false
+    -- BodyGyro로 회전 제어
+    if not faBodyGyro then
+        faBodyGyro = Instance.new("BodyGyro")
+        faBodyGyro.MaxTorque = Vector3.new(math.huge, 0, math.huge)
+        faBodyGyro.P = 10000
+        faBodyGyro.D = 500
+        faBodyGyro.Parent = rootPart
+    end
+    
+    -- Humanoid 설정
+    humanoid.AutoRotate = false
+    humanoid.PlatformStand = true
 end
 
-local function faStartAutoClick()
-    if faAutoClickConnection then faAutoClickConnection:Disconnect() end
-    faAutoClickConnection = RunService.RenderStepped:Connect(function()
-        if not FULL_AUTO_ENABLED then 
-            if faAutoClickConnection then faAutoClickConnection:Disconnect() faAutoClickConnection = nil end
-            return 
+-- 물리 해제
+local function faCleanupPhysics()
+    local character = LocalPlayer.Character
+    if character then
+        -- BodyVelocity 제거
+        if faBodyVelocity then
+            faBodyVelocity:Destroy()
+            faBodyVelocity = nil
         end
+        
+        -- BodyGyro 제거
+        if faBodyGyro then
+            faBodyGyro:Destroy()
+            faBodyGyro = nil
+        end
+        
+        -- Humanoid 복구
+        local humanoid = character:FindFirstChild("Humanoid")
+        if humanoid then
+            humanoid.AutoRotate = true
+            humanoid.PlatformStand = false
+        end
+        
+        -- 충돌 활성화
+        for _, part in pairs(character:GetDescendants()) do
+            if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
+                part.CanCollide = true
+            end
+        end
+    end
+end
+
+-- 바닥에 캐릭터 숨기기
+local function faHideInFloor(floorPart, hitPosition)
+    local character = LocalPlayer.Character
+    if not character then return end
+    
+    local rootPart = character:FindFirstChild("HumanoidRootPart")
+    if not rootPart then return end
+    
+    -- 바닥 상단 Y 좌표
+    local floorTopY = hitPosition.Y
+    
+    -- 휴머노이드를 바닥 바로 아래에 배치 (매우 근접하게)
+    local hideY = floorTopY - FA_HIDE_OFFSET
+    
+    -- 새 위치 계산
+    local newPosition = Vector3.new(rootPart.Position.X, hideY, rootPart.Position.Z)
+    
+    -- 평평하게 눕히기 (X축 90도 회전)
+    local newCFrame = CFrame.new(newPosition) * CFrame.Angles(math.rad(90), 0, 0)
+    
+    -- BodyGyro로 회전 고정
+    if faBodyGyro then
+        faBodyGyro.CFrame = newCFrame
+    end
+    
+    -- 위치 설정
+    rootPart.CFrame = newCFrame
+end
+
+-- Auto Click
+local function faStartAutoClick()
+    if faAutoClickConnection then
+        faAutoClickConnection:Disconnect()
+    end
+    
+    faAutoClickConnection = RunService.RenderStepped:Connect(function()
+        if not FULL_AUTO_ENABLED then
+            if faAutoClickConnection then
+                faAutoClickConnection:Disconnect()
+                faAutoClickConnection = nil
+            end
+            return
+        end
+        
         if MainFrame.Visible then return end
         
-        local cur = tick()
-        if cur - faLastAutoClickTime >= FA_CLICK_INTERVAL then
-            faLastAutoClickTime = cur
-            pcall(function() mouse1click() end)
+        local currentTime = tick()
+        if currentTime - faLastAutoClickTime >= FA_CLICK_INTERVAL then
+            faLastAutoClickTime = currentTime
+            pcall(function()
+                mouse1click()
+            end)
         end
     end)
 end
 
+-- 메인 루프
 local function faMainLoop()
     faLoopActive = true
+    
     while FULL_AUTO_ENABLED do
         task.wait(0.1)
+        
         if not FULL_AUTO_ENABLED then break end
         
-        faTargetPlayer = faFindClosestEnemy()
+        -- 가장 가까운 적군 찾기
+        local closestEnemy = faFindClosestEnemy()
         
-        if faTargetPlayer and faTargetPlayer.Character then
-            local targetRoot = faTargetPlayer.Character:FindFirstChild("HumanoidRootPart")
-            if targetRoot then
-                local floorPart, floorPosition = faFindNearestFloorPart(targetRoot.Position)
+        if closestEnemy and closestEnemy.Character then
+            local enemyRoot = closestEnemy.Character:FindFirstChild("HumanoidRootPart")
+            
+            if enemyRoot then
+                -- 적군 위치 근처의 바닥 찾기
+                local floorPart, hitPosition = faFindFloorNearPosition(enemyRoot.Position)
                 
-                if floorPart and floorPosition then
-                    faLastFloorPart = floorPart
-                    faPositionOnFloor(floorPart, floorPosition)
-                elseif faLastFloorPart then
-                    local lastFloorPos = faLastFloorPart.Position
-                    local _, lastFloorHitPos = faFindNearestFloorPart(lastFloorPos + Vector3.new(0, 5, 0))
-                    if lastFloorHitPos then
-                        faPositionOnFloor(faLastFloorPart, lastFloorHitPos)
-                    end
+                if floorPart and hitPosition then
+                    -- 유효한 바닥 발견 - 저장
+                    faCurrentFloor = floorPart
+                    faLastValidFloor = {part = floorPart, position = hitPosition}
+                    
+                    -- 바닥에 숨기기
+                    faHideInFloor(floorPart, hitPosition)
+                    
+                elseif faLastValidFloor then
+                    -- 현재 바닥을 찾지 못했지만 이전 바닥이 있음
+                    faHideInFloor(faLastValidFloor.part, faLastValidFloor.position)
                 end
             end
-        else
-            task.wait(0.5)
+        elseif faLastValidFloor then
+            -- 적군이 없지만 이전 바닥이 있음
+            faHideInFloor(faLastValidFloor.part, faLastValidFloor.position)
         end
     end
+    
     faLoopActive = false
 end
 
+-- Full Auto 캐릭터 리스폰 처리
 LocalPlayer.CharacterAdded:Connect(function(character)
     if FULL_AUTO_ENABLED then
         task.wait(1)
-        faRotationAngle = 0
+        
+        -- 초기화
         faTargetPlayer = nil
-        faLastFloorPart = nil
+        faCurrentFloor = nil
+        
+        -- 물리 설정
+        faSetupPhysics()
         faStartAutoClick()
-        if not faLoopActive then task.spawn(faMainLoop) end
+        
+        -- 메인 루프 재시작
+        if not faLoopActive then
+            task.spawn(faMainLoop)
+        end
     end
 end)
 
@@ -1816,11 +1965,14 @@ local function createESP(player)
         bGui.AlwaysOnTop = true
         bGui.Enabled = ESP_ENABLED and isEnemy(player)
         
+        -- 메인 컨테이너 (투명)
         local container = Instance.new("Frame", bGui)
         container.Size = UDim2.new(1, 0, 1, 0)
         container.BackgroundTransparency = 1
         
+        -- 검은색 윤곽선을 가진 라인 생성 함수
         local function line(s, p)
+            -- 검은색 외곽선 (더 두껍게)
             local outline = Instance.new("Frame", container)
             outline.BackgroundColor3 = Color3.new(0, 0, 0)
             outline.BorderSizePixel = 0
@@ -1828,6 +1980,7 @@ local function createESP(player)
             outline.Position = UDim2.new(p.X.Scale, p.X.Offset - 1, p.Y.Scale, p.Y.Offset - 1)
             outline.ZIndex = 1
             
+            -- 흰색 메인 라인
             local f = Instance.new("Frame", container)
             f.BackgroundColor3 = Color3.new(1, 1, 1)
             f.BorderSizePixel = 0
@@ -1838,10 +1991,11 @@ local function createESP(player)
             return f, outline
         end
         
-        line(UDim2.new(1, 0, 0, 1), UDim2.new(0, 0, 0, 0))
-        line(UDim2.new(1, 0, 0, 1), UDim2.new(0, 0, 1, -1))
-        line(UDim2.new(0, 1, 1, 0), UDim2.new(0, 0, 0, 0))
-        line(UDim2.new(0, 1, 1, 0), UDim2.new(1, -1, 0, 0))
+        -- 박스의 4개 라인 그리기
+        line(UDim2.new(1, 0, 0, 1), UDim2.new(0, 0, 0, 0))       -- 상단
+        line(UDim2.new(1, 0, 0, 1), UDim2.new(0, 0, 1, -1))      -- 하단
+        line(UDim2.new(0, 1, 1, 0), UDim2.new(0, 0, 0, 0))       -- 좌측
+        line(UDim2.new(0, 1, 1, 0), UDim2.new(1, -1, 0, 0))      -- 우측
         
         local hGui = Instance.new("BillboardGui", root)
         hGui.Name = "HealthESP_Gui"
@@ -1873,7 +2027,7 @@ local function createESP(player)
         local function update()
             local p = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
             hFill.Size = UDim2.new(1, 0, p, 0)
-            hFill.BackgroundColor3 = Color3.fromHSV(p * 0.3, 1, 1)
+            hFill.BackgroundColor3 = Color3.fromHSV(p * 0.3,1, 1)
             hText.Text = math.floor(hum.Health) .. "/" .. math.floor(hum.MaxHealth)
         end
         hum.HealthChanged:Connect(update)
@@ -1914,18 +2068,48 @@ end, "MatchMode", AUTO_MATCH_ENABLED)
 UIHandlers.UpdateFullAuto = CreateToggle("full Auto", AimPage, function(v)
     FULL_AUTO_ENABLED = v
     if v then
-        AUTO_MATCH_ENABLED = true
-        UIHandlers.UpdateAutoMatch(true)
+        -- Full Auto 활성화 시 Auto Match도 자동으로 활성화
+        if not AUTO_MATCH_ENABLED then
+            AUTO_MATCH_ENABLED = true
+            UIHandlers.UpdateAutoMatch(true)
+            saveConfig()
+        end
         
-        faRotationAngle = 0
+        -- 초기화
         faTargetPlayer = nil
-        faLastFloorPart = nil
+        faCurrentFloor = nil
+        
+        -- 물리 설정
+        faSetupPhysics()
         faStartAutoClick()
-        if not faLoopActive then task.spawn(faMainLoop) end
+        
+        -- 메인 루프 시작
+        if not faLoopActive then
+            task.spawn(faMainLoop)
+        end
+        
         createNotification("Full Auto Started")
     else
-        if faAutoClickConnection then faAutoClickConnection:Disconnect() faAutoClickConnection = nil end
+        -- Full Auto 비활성화
+        if faMainConnection then
+            faMainConnection:Disconnect()
+            faMainConnection = nil
+        end
+        
+        if faAutoClickConnection then
+            faAutoClickConnection:Disconnect()
+            faAutoClickConnection = nil
+        end
+        
+        -- 물리 해제
+        faCleanupPhysics()
+        
+        -- 초기화
         faLoopActive = false
+        faTargetPlayer = nil
+        faCurrentFloor = nil
+        faLastValidFloor = nil
+        
         createNotification("Full Auto Stopped")
     end
 end, nil, FULL_AUTO_ENABLED)
@@ -1995,7 +2179,6 @@ end, nil, THIRD_PERSON_ENABLED)
 
 CreateToggle("Load skin changer", VisualPage, function(v)
     SKIN_CHANGER_ENABLED = v
-    ifSKIN_CHANGER_ENABLED = v
     if v then
         local success, err = pcall(function()
             loadstring(game:HttpGet("https://raw.githubusercontent.com/kgycoder/Rivals-Skin-changer/refs/heads/main/Rivals-Skin%20changer", true))()
@@ -2139,9 +2322,12 @@ local function RunLoadingSequence()
     UpdateLoadingProgress(88, "Initializing Auto Features...")
     if FULL_AUTO_ENABLED then
         pcall(function()
-            faRotationAngle = 0
+            if not AUTO_MATCH_ENABLED then
+                AUTO_MATCH_ENABLED = true
+            end
             faTargetPlayer = nil
-            faLastFloorPart = nil
+            faCurrentFloor = nil
+            faSetupPhysics()
             faStartAutoClick()
             if not faLoopActive then task.spawn(faMainLoop) end
         end)
@@ -2174,11 +2360,18 @@ if FULL_AUTO_ENABLED then
     end
     Players.PlayerAdded:Connect(createESP)
     Players.PlayerAdded:Connect(setupPlayerTracking)
-    faRotationAngle = 0
+    
+    -- Full Auto 초기화
+    if not AUTO_MATCH_ENABLED then
+        AUTO_MATCH_ENABLED = true
+    end
     faTargetPlayer = nil
-    faLastFloorPart = nil
+    faCurrentFloor = nil
+    faLastValidFloor = nil
+    faSetupPhysics()
     faStartAutoClick()
     if not faLoopActive then task.spawn(faMainLoop) end
+    
     if AUTO_MATCH_ENABLED then attemptJoinMatch() end
     if SKIN_CHANGER_ENABLED then
         pcall(function()
